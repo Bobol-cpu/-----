@@ -1,112 +1,54 @@
-#include <stdarg.h>
+/* ============================================================
+ *  贪吃蛇（简化版）
+ *  编译：gcc snake_simple.c -o snake
+ *  操作：WASD / 方向键 移动   Q 退出   R 重开
+ *
+ *  核心思路与完整版一致：
+ *    1) 棋盘是纯逻辑的 W×H 网格，越界即撞墙（数值判界，无墙实体）
+ *    2) 蛇用数组当队列：body[0] 是头，整体后移一格再把新头放到 0
+ *    3) 字符终端像打字机：整帧拼进缓冲区，归位到左上角后一次写出
+ * ============================================================ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+
 #ifdef _WIN32
 #  include <conio.h>
 #  include <windows.h>
 #else
-# include <termios.h>
-# include <unistd.h>
+#  include <termios.h>
+#  include <unistd.h>
 #endif
 
-/* ------------------------------ 可调参数 ------------------------------ */
-#define BOARD_W     30                     /* 棋盘宽度（格） */
-#define BOARD_H     20                     /* 棋盘高度（格） */
-#define MAX_LEN     (BOARD_W * BOARD_H)    /* 蛇的最大长度 */
-#define START_DELAY 140                    /* 初始速度：每走一格耗时(ms)，越小越快 */
-#define MIN_DELAY   45                     /* 最快速度上限 */
-#define SPEED_STEP  6                      /* 每吃一个食物加快的毫秒数 */
-#define TICK_MS     5                      /* 输入轮询间隔(ms) */
+#define W      30             /* 棋盘宽（格） */
+#define H      20             /* 棋盘高（格） */
+#define MAXLEN (W * H)        /* 蛇的最大长度 */
+#define DELAY  120            /* 每走一格耗时(ms) */
 
-/* ------------------------------ 方向定义 ------------------------------ */
-enum { DIR_UP = 0, DIR_RIGHT, DIR_DOWN, DIR_LEFT };
+typedef struct { int x, y; } Pt;
 
-static const int DX[4] = {  0,  1,  0, -1 };
-static const int DY[4] = { -1,  0,  1,  0 };
+static Pt  body[MAXLEN];      /* body[0]=蛇头, body[len-1]=蛇尾 */
+static int len, dir;          /* dir: 0上 1右 2下 3左 */
+static int fx, fy;            /* 食物 */
+static int score, over;       /* 得分、是否结束 */
 
-/* ------------------------------ 按键定义 ------------------------------ */
-enum {
-    KEY_NONE = 0,
-    KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
-    KEY_PAUSE, KEY_RESTART, KEY_QUIT
-};
+static const int DX[4] = { 0, 1, 0, -1 };
+static const int DY[4] = { -1, 0, 1, 0 };
 
-/* ------------------------------ 数据结构 ------------------------------ */
-typedef struct {
-    int x, y;
-} Cell;
+/* ======================= 控制台 ======================= */
 
-typedef struct {
-    Cell body[MAX_LEN];   /* body[0] 是蛇头，body[len-1] 是蛇尾 */
-    int  len;             /* 当前长度 */
-    int  dir;             /* 当前方向 */
-} Snake;
-
-/* ====================== 终端 / 控制台相关工具函数 ====================== */
-
-#ifndef _WIN32
-static struct termios g_old_term;
-#endif
-
-static void cursor_visible(int visible);   /* 前置声明 */
-
-/* 初始化控制台：Windows 下切换为 UTF-8 输出代码页；
- * Linux 下把终端设为「非规范 + 无回显」模式，实现按键即时读取 */
-static void console_init(void)
-{
-#ifdef _WIN32
-    SetConsoleOutputCP(CP_UTF8);   /* 否则中文提示在 GBK 代码页控制台里会乱码 */
-#else
-    struct termios t;
-    tcgetattr(STDIN_FILENO, &g_old_term);
-    t = g_old_term;
-    t.c_lflag &= (tcflag_t)~(ICANON | ECHO);
-    t.c_cc[VMIN]  = 0;
-    t.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &t);
-#endif
-}
-
-/* 程序退出前恢复终端状态并重新显示光标 */
-static void console_restore(void)
-{
-#ifndef _WIN32
-    tcsetattr(STDIN_FILENO, TCSANOW, &g_old_term);
-#endif
-    cursor_visible(1);
-}
-
-/* 把光标移动到指定坐标（左上角为 0,0），避免整屏清屏造成的闪烁 */
 static void gotoxy(int x, int y)
 {
 #ifdef _WIN32
-    COORD pos;
-    pos.X = (SHORT)x;
-    pos.Y = (SHORT)y;
-    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), pos);
+    COORD p;
+    p.X = (SHORT)x;
+    p.Y = (SHORT)y;
+    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), p);
 #else
     printf("\033[%d;%dH", y + 1, x + 1);
 #endif
 }
 
-/* 显示 / 隐藏光标 */
-static void cursor_visible(int visible)
-{
-#ifdef _WIN32
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_CURSOR_INFO info;
-    if (GetConsoleCursorInfo(h, &info)) {
-        info.bVisible = visible ? TRUE : FALSE;
-        SetConsoleCursorInfo(h, &info);
-    }
-#else
-    fputs(visible ? "\033[?25h" : "\033[?25l", stdout);
-    fflush(stdout);
-#endif
-}
-
-/* 毫秒级睡眠 */
 static void sleep_ms(int ms)
 {
 #ifdef _WIN32
@@ -119,331 +61,200 @@ static void sleep_ms(int ms)
 #endif
 }
 
-/* 清屏并把光标复位到左上角 */
-static void clear_screen(void)
-{
 #ifdef _WIN32
-    system("cls");
+static void term_init(void) { SetConsoleOutputCP(CP_UTF8); }
+static void term_done(void) { }
 #else
-    fputs("\033[2J", stdout);
-#endif
-    gotoxy(0, 0);
-}
-
-/* 非阻塞读取一个按键，返回统一的按键编号 */
-static int key_poll(void)
+static struct termios old_term;
+static void term_init(void)              /* 关行缓冲与回显，让按键即时可读 */
 {
-    int c = KEY_NONE;
+    struct termios t;
+    tcgetattr(STDIN_FILENO, &old_term);
+    t = old_term;
+    t.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+    t.c_cc[VMIN]  = 0;
+    t.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+}
+static void term_done(void) { tcsetattr(STDIN_FILENO, TCSANOW, &old_term); }
+#endif
 
+/* 读一个键：-1 无, 0-3 方向, 4 退出, 5 重开 */
+static int read_key(void)
+{
+    int c;
 #ifdef _WIN32
-    if (!_kbhit()) return KEY_NONE;
+    if (!_kbhit()) return -1;
     c = _getch();
-    if (c == 0 || c == 0xE0) {          /* 方向键等扩展键的前导字节 */
+    if (c == 0 || c == 0xE0) {           /* 方向键是两字节，前导符后才是扫描码 */
         switch (_getch()) {
-            case 72: return KEY_UP;
-            case 80: return KEY_DOWN;
-            case 75: return KEY_LEFT;
-            case 77: return KEY_RIGHT;
-            default: return KEY_NONE;
+            case 72: return 0;
+            case 77: return 1;
+            case 80: return 2;
+            case 75: return 3;
+            default: return -1;
         }
     }
 #else
     {
         unsigned char ch;
-        if (read(STDIN_FILENO, &ch, 1) != 1) return KEY_NONE;
+        if (read(STDIN_FILENO, &ch, 1) != 1) return -1;
         c = (int)ch;
-        if (c == 27) {                  /* ESC 或方向键转义序列 */
-            unsigned char s1 = 0, s2 = 0;
-            if (read(STDIN_FILENO, &s1, 1) == 1 &&
-                read(STDIN_FILENO, &s2, 1) == 1 && s1 == '[') {
-                switch (s2) {
-                    case 'A': return KEY_UP;
-                    case 'B': return KEY_DOWN;
-                    case 'C': return KEY_RIGHT;
-                    case 'D': return KEY_LEFT;
+        if (c == 27) {                   /* ESC 或 ESC[A~D 转义序列 */
+            unsigned char a = 0, b = 0;
+            if (read(STDIN_FILENO, &a, 1) == 1 && a == '[' &&
+                read(STDIN_FILENO, &b, 1) == 1) {
+                switch (b) {
+                    case 'A': return 0;
+                    case 'C': return 1;
+                    case 'B': return 2;
+                    case 'D': return 3;
                 }
             }
-            return KEY_QUIT;            /* 单独按下 ESC：退出 */
+            return 4;
         }
     }
 #endif
-
     switch (c) {
-        case 'w': case 'W':          return KEY_UP;
-        case 's': case 'S':          return KEY_DOWN;
-        case 'a': case 'A':          return KEY_LEFT;
-        case 'd': case 'D':          return KEY_RIGHT;
-        case 'p': case 'P': case ' ': return KEY_PAUSE;
-        case 'r': case 'R':          return KEY_RESTART;
-        case 'q': case 'Q':          return KEY_QUIT;
-        default:                     return KEY_NONE;
+        case 'w': case 'W': return 0;
+        case 'd': case 'D': return 1;
+        case 's': case 'S': return 2;
+        case 'a': case 'A': return 3;
+        case 'q': case 'Q': return 4;
+        case 'r': case 'R': return 5;
+        default:            return -1;
     }
 }
 
-/* ============================== 游戏逻辑 ============================== */
+/* ======================= 渲染 ======================= */
 
-/* 把方向编号换算成按键编号 */
-static int dir_from_key(int key)
+/* 整帧拼进缓冲区 → 归位 → 一次写出，避免闪烁 */
+static void draw(void)
 {
-    switch (key) {
-        case KEY_UP:    return DIR_UP;
-        case KEY_RIGHT: return DIR_RIGHT;
-        case KEY_DOWN:  return DIR_DOWN;
-        default:        return DIR_LEFT;
-    }
-}
-
-/* 反方向 */
-static int opposite(int dir)
-{
-    return (dir + 2) % 4;
-}
-
-/* 初始化蛇：长度 3，位于棋盘中央，朝右 */
-static void init_snake(Snake *s)
-{
-    s->len = 3;
-    s->dir = DIR_RIGHT;
-    s->body[0].x = BOARD_W / 2;
-    s->body[0].y = BOARD_H / 2;
-    s->body[1].x = s->body[0].x - 1;
-    s->body[1].y = s->body[0].y;
-    s->body[2].x = s->body[0].x - 2;
-    s->body[2].y = s->body[0].y;
-}
-
-/* 在空白格中随机放置食物；棋盘已满时返回 0 */
-static int place_food(const Snake *s, Cell *food)
-{
-    static Cell free_cells[MAX_LEN];
-    int n = 0;
-    int x, y, i;
-
-    for (y = 0; y < BOARD_H; ++y) {
-        for (x = 0; x < BOARD_W; ++x) {
-            int occupied = 0;
-            for (i = 0; i < s->len; ++i) {
-                if (s->body[i].x == x && s->body[i].y == y) {
-                    occupied = 1;
-                    break;
-                }
-            }
-            if (!occupied) {
-                free_cells[n].x = x;
-                free_cells[n].y = y;
-                ++n;
-            }
-        }
-    }
-
-    if (n == 0) return 0;               /* 没有空格，通关 */
-    *food = free_cells[rand() % n];
-    return 1;
-}
-
-/* 把格式化文本追加到绘图缓冲区（带边界保护） */
-static void put(char **p, size_t *left, const char *fmt, ...)
-{
-    va_list ap;
-    int n;
-
-    va_start(ap, fmt);
-    n = vsnprintf(*p, *left, fmt, ap);
-    va_end(ap);
-
-    if (n < 0) return;
-    if ((size_t)n >= *left) {           /* 缓冲区不够：截断到末尾 */
-        *p += *left - 1;
-        *left = 1;
-    } else {
-        *p += (size_t)n;
-        *left -= (size_t)n;
-    }
-}
-
-/* 一次性画出整个画面：先拼进缓冲区，再一次性输出，杜绝闪烁 */
-static void draw(const Snake *s, Cell food, int score, int best, int delay, int paused)
-{
-    static char buf[8192];
+    static char buf[2048];
     char *p = buf;
-    size_t left = sizeof(buf);
     int x, y, i;
 
-    /* 上边框 */
-    put(&p, &left, "+");
-    for (x = 0; x < BOARD_W; ++x) put(&p, &left, "-");
-    put(&p, &left, "+\n");
+    *p++ = '+';
+    for (x = 0; x < W; ++x) *p++ = '-';
+    *p++ = '+'; *p++ = '\n';
 
-    /* 棋盘主体 + 右侧状态栏 */
-    for (y = 0; y < BOARD_H; ++y) {
-        put(&p, &left, "|");
-        for (x = 0; x < BOARD_W; ++x) {
-            char c = ' ';
-            if (s->body[0].x == x && s->body[0].y == y) {
-                c = '@';                                   /* 蛇头 */
-            } else if (food.x == x && food.y == y) {
-                c = '*';                                   /* 食物 */
-            } else {
-                for (i = 1; i < s->len; ++i) {
-                    if (s->body[i].x == x && s->body[i].y == y) {
-                        c = 'o';                               /* 蛇身 */
-                        break;
-                    }
-                }
-            }
-            put(&p, &left, "%c", c);
+    for (y = 0; y < H; ++y) {
+        *p++ = '|';
+        for (x = 0; x < W; ++x) {
+            char ch = ' ';
+            if (body[0].x == x && body[0].y == y)      ch = '@';   /* 蛇头 */
+            else if (x == fx && y == fy)               ch = '*';   /* 食物 */
+            else for (i = 1; i < len; ++i)
+                if (body[i].x == x && body[i].y == y) { ch = 'o'; break; }
+            *p++ = ch;
         }
-        put(&p, &left, "|");
-
-        switch (y) {
-            case 0: put(&p, &left, "   得分 : %d", score);            break;
-            case 1: put(&p, &left, "   长度 : %d", s->len);           break;
-            case 2: put(&p, &left, "   最高 : %d", best);             break;
-            case 3: put(&p, &left, "   速度 : %d ms/格", delay);      break;
-            case 5: put(&p, &left, "   ↑↓←→ / WASD  移动");          break;
-            case 6: put(&p, &left, "   P / 空格      暂停");          break;
-            case 7: put(&p, &left, "   Q / ESC       退出");          break;
-        }
-        put(&p, &left, "\n");
+        *p++ = '|'; *p++ = '\n';
     }
 
-    /* 下边框 */
-    put(&p, &left, "+");
-    for (x = 0; x < BOARD_W; ++x) put(&p, &left, "-");
-    put(&p, &left, "+\n");
+    *p++ = '+';
+    for (x = 0; x < W; ++x) *p++ = '-';
+    *p++ = '+'; *p++ = '\n';
 
-    if (paused) put(&p, &left, "   *** 已暂停，按 P 或空格继续 ***\n");
-    else        put(&p, &left, "\n");   /* 占位，擦掉上一帧可能残留的提示 */
+    /* 状态栏就是棋盘下方那一行，每帧重写，所以不会有残留 */
+    if (over) p += sprintf(p, " 游戏结束！得分 %d   按 R 重开，按 Q 退出\n", score);
+    else      p += sprintf(p, " 得分 %d   长度 %d\n", score, len);
 
     gotoxy(0, 0);
     fwrite(buf, 1, (size_t)(p - buf), stdout);
     fflush(stdout);
 }
 
-/* ================================ 主程序 ================================ */
+/* ======================= 逻辑 ======================= */
+
+static void reset(void)
+{
+    len   = 3;
+    dir   = 1;                        /* 朝右 */
+    score = 0;
+    over  = 0;
+    body[0].x = W / 2;     body[0].y = H / 2;
+    body[1].x = W / 2 - 1; body[1].y = H / 2;
+    body[2].x = W / 2 - 2; body[2].y = H / 2;
+}
+
+/* 在空格上随机放食物；棋盘已满返回 0。
+ * 用"随机取点、撞上蛇就重试"的写法，比枚举空格短得多 */
+static int put_food(void)
+{
+    int t, x, y, i;
+    for (t = 0; t < 500; ++t) {
+        x = rand() % W;
+        y = rand() % H;
+        for (i = 0; i < len; ++i)
+            if (body[i].x == x && body[i].y == y) break;
+        if (i == len) { fx = x; fy = y; return 1; }
+    }
+    return 0;
+}
+
+/* ======================= 主程序 ======================= */
 
 int main(void)
 {
-    Snake s;
-    Cell  food;
-    int   best = 0;
+    int i, k, elapsed, nx, ny, eat, hit, limit;
 
-    console_init();
-    atexit(console_restore);            /* 无论怎么退出都能还原终端 */
-    cursor_visible(0);
-    clear_screen();
+    term_init();
+    atexit(term_done);                /* 异常退出也能还原终端 */
     srand((unsigned)time(NULL));
 
-    for (;;) {                          /* 每轮 = 一局游戏 */
-        int score = 0;
-        int delay = START_DELAY;
-        int paused = 0, over = 0, win = 0, quit = 0;
-        int pending_dir;
+    for (;;) {                        /* 每轮 = 一局 */
+        reset();
+        put_food();
+        draw();
 
-        init_snake(&s);
-        pending_dir = s.dir;
-        place_food(&s, &food);
-        draw(&s, food, score, best, delay, 0);
-
-        /* ---------------------------- 单局主循环 ---------------------------- */
-        while (!over && !quit) {
-            int elapsed = 0;
-
-            /* 等待一帧的时间，期间不断轮询按键 */
-            while (elapsed < delay) {
-                int k = key_poll();
-
-                if (k == KEY_QUIT) {
-                    quit = 1;
-                    break;
-                } else if (k == KEY_PAUSE) {
-                    paused = !paused;
-                } else if (k >= KEY_UP && k <= KEY_RIGHT) {
-                    int d = dir_from_key(k);
-                    if (d != opposite(s.dir)) pending_dir = d;   /* 禁止 180° 掉头 */
-                }
-
-                sleep_ms(TICK_MS);
-                elapsed += TICK_MS;
+        while (!over) {
+            /* --- 等一帧，期间不停轮询按键 --- */
+            k = -1;
+            elapsed = 0;
+            while (elapsed < DELAY) {
+                int t = read_key();
+                if (t == 4) return 0;                       /* Q：退出 */
+                if (t >= 0 && t <= 3 && t != (dir + 2) % 4) /* 禁止 180° 掉头 */
+                    k = t;
+                sleep_ms(5);
+                elapsed += 5;
             }
-            if (quit) break;
+            if (k >= 0) dir = k;
 
-            /* 暂停：画面照常刷新，但不推进蛇 */
-            if (paused) {
-                draw(&s, food, score, best, delay, 1);
-                continue;
+            /* --- 算新蛇头，先判死再移动 --- */
+            nx  = body[0].x + DX[dir];
+            ny  = body[0].y + DY[dir];
+            eat = (nx == fx && ny == fy);
+
+            if (nx < 0 || nx >= W || ny < 0 || ny >= H) { over = 1; break; }
+
+            limit = eat ? len : len - 1;   /* 不吃食物时蛇尾会移开，不算撞 */
+            hit = 0;
+            for (i = 1; i < limit; ++i)
+                if (body[i].x == nx && body[i].y == ny) { hit = 1; break; }
+            if (hit) { over = 1; break; }
+
+            /* --- 头插尾删：先扩容（吃到食物时），再从尾向头搬一格 --- */
+            if (eat && len < MAXLEN) ++len;
+            for (i = len - 1; i > 0; --i) body[i] = body[i - 1];
+            body[0].x = nx;
+            body[0].y = ny;
+
+            if (eat) {
+                score += 10;
+                if (!put_food()) over = 1;   /* 棋盘被填满 */
             }
-
-            s.dir = pending_dir;
-
-            {
-                Cell nh;
-                nh.x = s.body[0].x + DX[s.dir];
-                nh.y = s.body[0].y + DY[s.dir];
-
-                if (nh.x < 0 || nh.x >= BOARD_W || nh.y < 0 || nh.y >= BOARD_H) {
-                    over = 1;                                   /* 撞墙 */
-                } else {
-                    int eat   = (nh.x == food.x && nh.y == food.y);
-                    int limit = eat ? s.len : s.len - 1;        /* 不吃食物时蛇尾会移开 */
-                    int i;
-
-                    for (i = 1; i < limit; ++i) {
-                        if (s.body[i].x == nh.x && s.body[i].y == nh.y) {
-                            over = 1;                               /* 咬到自己 */
-                            break;
-                        }
-                    }
-
-                    if (!over) {
-                        /* 整体后移一格，再把新蛇头放到最前面 */
-                        for (i = s.len - 1; i > 0; --i) s.body[i] = s.body[i - 1];
-                        s.body[0] = nh;
-
-                        if (eat) {
-                            if (s.len < MAX_LEN) ++s.len;
-                            score += 10;
-                            if (score > best) best = score;
-
-                            delay -= SPEED_STEP;                    /* 越吃越快 */
-                            if (delay < MIN_DELAY) delay = MIN_DELAY;
-
-                            if (!place_food(&s, &food)) {           /* 棋盘被填满 */
-                                win = 1;
-                                over = 1;
-                            }
-                        }
-                    }
-                }
-            }
-
-            draw(&s, food, score, best, delay, 0);
+            draw();
         }
 
-        if (quit) break;                /* 玩家主动退出 */
+        draw();                       /* 补一帧，让状态栏显示"游戏结束" */
 
-        /* ---------------------------- 结算界面 ---------------------------- */
-        gotoxy(0, BOARD_H + 2);
-        if (win) {
-            printf("  *** 恭喜通关！蛇填满了整个棋盘，得分 %d ***\n", score);
-        } else {
-            printf("  *** 游戏结束！本次得分 %d，历史最高 %d ***\n", score, best);
-        }
-        printf("  按 R 重新开始，按 Q 退出 ...\n");
-        fflush(stdout);
-
-        for (;;) {
-            int k = key_poll();
-            if (k == KEY_QUIT) { quit = 1; break; }
-            if (k == KEY_RESTART) break;
+        for (;;) {                    /* 结算：等 R 或 Q */
+            int t = read_key();
+            if (t == 4) return 0;
+            if (t == 5) break;
             sleep_ms(30);
         }
-        if (quit) break;
-
-        clear_screen();
     }
-
-    gotoxy(0, BOARD_H + 4);
-    printf("  感谢游玩，再见！\n");
-    return 0;
 }
